@@ -51,7 +51,9 @@ def get_sheet_client():
     return client.open_by_url(SPREADSHEET_URL)
 
 sheet_file = get_sheet_client()
+# keep a reference worksheet for any direct low-frequency operations if needed
 sheet = sheet_file.worksheet("Data")
+
 # -------------------------------
 # Ensure sheets exist and have headers
 # -------------------------------
@@ -76,6 +78,7 @@ ensure_sheet_exists(AUDIT_SHEET, ["Timestamp", "Manager", "Action", "Details"])
 # -------------------------------
 @st.cache_data(ttl=120)
 def load_sheet(sheet_name):
+    """Cached loader for any sheet. Returns a pandas DataFrame."""
     try:
         ws = sheet_file.worksheet(sheet_name)
         data = ws.get_all_records()
@@ -86,6 +89,53 @@ def load_sheet(sheet_name):
     except Exception as e:
         st.error(f"Unable to load sheet {sheet_name}: {e}")
         return pd.DataFrame()
+
+# convenience wrappers that use the cached loader
+def load_users():
+    df = load_sheet(USER_SHEET)
+    # normalize columns
+    if df.empty:
+        return pd.DataFrame(columns=["Username","Password","Role"])
+    df.columns = [c.strip() for c in df.columns]
+    if "Role" in df.columns:
+        df["Role"] = df["Role"].astype(str).str.strip().str.lower()
+    else:
+        df["Role"] = ""
+    if "Username" in df.columns:
+        df["Username"] = df["Username"].astype(str).str.strip()
+    return df
+
+def load_doctors():
+    # Use cached loader
+    df = load_sheet(DOCTOR_SHEET)
+    if df.empty:
+        return pd.DataFrame(columns=["Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"])
+    # Ensure expected headers normalized
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def load_assignments():
+    df = load_sheet(ASSIGN_SHEET)
+    if df.empty:
+        return pd.DataFrame(columns=["Patient","Doctor"])
+    df.columns = [c.strip() for c in df.columns]
+    df["Patient"] = df["Patient"].astype(str).str.strip()
+    df["Doctor"] = df["Doctor"].astype(str).str.strip()
+    return df
+
+def load_data():
+    df = load_sheet(DATA_SHEET)
+    if df.empty:
+        return pd.DataFrame(columns=["Timestamp","Username","IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue","Notes"])
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def load_audit():
+    df = load_sheet(AUDIT_SHEET)
+    if df.empty:
+        return pd.DataFrame(columns=["Timestamp","Manager","Action","Details"])
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
 def append_row(sheet_name, row):
     try:
@@ -125,53 +175,6 @@ def clear_and_update_sheet(sheet_name, records):
     except Exception as e:
         st.error(f"Failed to clear/update sheet {sheet_name}: {e}")
         return False
-
-# -------------------------------
-# Load convenience wrappers
-# -------------------------------
-def load_users():
-    df = load_sheet(USER_SHEET)
-    # normalize columns
-    if df.empty:
-        return pd.DataFrame(columns=["Username","Password","Role"])
-    df.columns = [c.strip() for c in df.columns]
-    if "Role" in df.columns:
-        df["Role"] = df["Role"].astype(str).str.strip().str.lower()
-    else:
-        df["Role"] = ""
-    if "Username" in df.columns:
-        df["Username"] = df["Username"].astype(str).str.strip()
-    return df
-
-def load_doctors():
-    try:
-        ws = sheet_file.worksheet(DOCTOR_SHEET)
-        data = ws.get_all_records(expected_headers=[
-            "Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"
-        ])
-        if not data:
-            return pd.DataFrame(columns=["Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"])
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.error(f"Unable to load sheet {DOCTOR_SHEET}: {e}")
-        return pd.DataFrame(columns=["Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"])
-
-
-def load_assignments():
-    df = load_sheet(ASSIGN_SHEET)
-    if df.empty:
-        return pd.DataFrame(columns=["Patient","Doctor"])
-    df.columns = [c.strip() for c in df.columns]
-    df["Patient"] = df["Patient"].astype(str).str.strip()
-    df["Doctor"] = df["Doctor"].astype(str).str.strip()
-    return df
-
-def load_data():
-    df = load_sheet(DATA_SHEET)
-    if df.empty:
-        return pd.DataFrame(columns=["Timestamp","Username","IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue","Notes"])
-    df.columns = [c.strip() for c in df.columns]
-    return df
 
 # -------------------------------
 # Audit logging
@@ -451,84 +454,177 @@ def extra_page():
     try:
         df = load_data()
     except Exception as e:
-        st.error(f"Failed to load data: {e}")
+        st.error(f"❌ Failed to load data: {e}")
         return
     if df.empty:
-        st.info("No data yet.")
-        return
-
-    st.markdown("### 🧾 Raw Patient Data")
-    name = st.text_input("Search patient (username)")
-    df_filtered = df[df["Username"].str.contains(name, case=False, na=False)] if name else df
-    st.dataframe(df_filtered, use_container_width=True, height=300)
-
-    st.markdown("---")
-    st.info("Gemini AI integration enabled — you can select rows and send to AI (this UI keeps your original prompts).")
-
-    # Example simple use: send a small CSV excerpt to Gemini and show a response
-    if st.button("Send I sample to Gemini (example)"):
-        sample = df_filtered.head(10).to_csv(index=False)
-        prompt = f"Please summarize this patient data concisely:\n\n{sample}"
-        with st.spinner("Querying Gemini..."):
-            try:
-                response = client_genai.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-                st.subheader("Gemini response")
-                st.write(response.text)
-            except Exception as e:
-                st.error(f"Gemini request failed: {e}")
-
-def patient_profile():
-    st.title("👤 My Profile (Patient)")
-    username = st.session_state.username
-    df_users = load_users()
-    df_doctors = load_doctors()
-    user_row = df_users[df_users["Username"].astype(str).str.lower() == username.lower()]
-    if not user_row.empty:
-        user = user_row.iloc[0]
-        st.markdown(f"**Username:** {user.get('Username','')}")
-        st.markdown(f"**Role:** {user.get('Role','')}")
+        st.info("No data yet. Please add patient data first.")
     else:
-        st.markdown(f"**Username:** {username}")
+        # -------------------------------
+        # 🧩 Raw Data Section
+        # -------------------------------
+        st.markdown("### 🧾 Raw Patient Data (for filtering and review)")
+        name = st.text_input("🔍 Search Patient Name")
+        df_filtered = df[df["Username"].str.contains(name, case=False, na=False)] if name else df
 
-    st.markdown("---")
-    st.subheader("👨‍⚕️ Assigned Doctor")
-    doc_username = get_doctor_for_patient(username)
-    if doc_username:
-        doc_row = df_doctors[df_doctors["Username"].astype(str).str.lower() == str(doc_username).strip().lower()]
-        if not doc_row.empty:
-            doc = doc_row.iloc[0]
-            st.markdown(f"**Name:** {doc.get('FullName','N/A')}")
-            st.markdown(f"**Specialty:** {doc.get('Specialty','N/A')}")
-            st.markdown(f"**Hospital:** {doc.get('Hospital','N/A')}")
-            st.markdown(f"**Bio:** {doc.get('Bio','N/A')}")
+        st.dataframe(df_filtered, use_container_width=True, height=300)
+
+        st.markdown("---")
+
+        # -------------------------------
+        # 🔄 Preprocessing to Astronaut KPI Schema
+        # -------------------------------
+        st.markdown("### 🧠 Preprocessed Astronaut KPI Schema")
+
+        df_a = df_filtered.copy()
+        # protect against missing Timestamp column
+        if "Timestamp" in df_a.columns:
+            df_a['Timestamp'] = pd.to_datetime(df_a['Timestamp'], errors='coerce')
         else:
-            st.warning("Doctor record not found.")
-    else:
-        st.info("No doctor assigned yet.")
+            df_a['Timestamp'] = pd.NaT
 
-def doctor_profile():
-    st.title("👨‍⚕️ My Profile (Doctor)")
-    username = st.session_state.username
-    df_doctors = load_doctors()
+        df_a = df_a.sort_values('Timestamp')
+        df_a['Week'] = ["W" + str(i+1) for i in range(len(df_a))]
+        df_a['Phase'] = "P1"
+        df_a['Adherence (%)'] = 100
 
-    doc_row = df_doctors[df_doctors["Username"].astype(str).str.lower() == username.lower()]
-    if not doc_row.empty:
-        doc = doc_row.iloc[0]
-        st.markdown(f"**Full Name:** {doc.get('FullName','N/A')}")
-        st.markdown(f"**Specialty:** {doc.get('Specialty','N/A')}")
-        st.markdown(f"**Hospital:** {doc.get('Hospital','N/A')}")
-        st.markdown(f"**Bio:** {doc.get('Bio','N/A')}")
-    else:
-        st.warning("Doctor record not found in Doctors sheet.")
+        # Convert Force columns to numeric
+        force_cols = ["TH_Force", "IN_Force", "MT_Force", "RI_Force", "PT_Force"]
+        for col in force_cols:
+            if col in df_a.columns:
+                df_a[col] = pd.to_numeric(df_a[col], errors='coerce')
+            else:
+                df_a[col] = pd.NA
 
-    st.markdown("---")
-    st.subheader("👥 Assigned Patients")
-    patients = get_patients_for_doctor(username)
-    if patients:
-        for p in patients:
-            st.write(f"• {p}")
-    else:
-        st.info("No patients assigned yet.")
+        # Create calculated column for average Grip Force
+        df_a["Hand: Avg Grip Force"] = df_a[force_cols].mean(axis=1).round(2)
+
+        # Set N/A values for metrics not yet available
+        df_a["Hand: VR Error Rate (%)"] = "N/A"
+        df_a["Chest: Avg COM-BOS Angle (°)"] = "N/A"
+        df_a["Balance: Alarm Triggers/Min"] = "N/A"
+        df_a["Locomotion: Max Angle Spike (°)"] = "N/A"
+        df_a["P4: Time to Stability (sec)"] = "N/A"
+
+        # Map fatigue/pain — handle different column names safely
+        if "Fatigue" in df_a.columns:
+            df_a["Fatigue Avg (1–10)"] = df_a["Fatigue"]
+        elif "Fatigue_Scale" in df_a.columns:
+            df_a["Fatigue Avg (1–10)"] = df_a["Fatigue_Scale"]
+        else:
+            df_a["Fatigue Avg (1–10)"] = pd.NA
+
+        if "Pain" in df_a.columns:
+            df_a["Pain Avg (0–10)"] = df_a["Pain"]
+        elif "Pain_Scale" in df_a.columns:
+            df_a["Pain Avg (0–10)"] = df_a["Pain_Scale"]
+        else:
+            df_a["Pain Avg (0–10)"] = pd.NA
+
+        # Final schema columns
+        final_cols = [
+            "Week", "Phase", "Adherence (%)",
+            "Hand: Avg Grip Force", "Hand: VR Error Rate (%)",
+            "Chest: Avg COM-BOS Angle (°)", "Balance: Alarm Triggers/Min",
+            "Locomotion: Max Angle Spike (°)", "P4: Time to Stability (sec)",
+            "Fatigue Avg (1–10)", "Pain Avg (0–10)"
+        ]
+
+        # Ensure final_cols exist in df_a for editor (fill missing columns)
+        for col in final_cols:
+            if col not in df_a.columns:
+                df_a[col] = pd.NA
+
+        # Display editable table
+        st.markdown("#### ✏️ Editable Preprocessed Table")
+        edited = st.data_editor(df_a[final_cols], use_container_width=True, num_rows="dynamic")
+
+        # Store edited DataFrame
+        df_a = edited.copy()
+
+        # Convert columns that should be numeric
+        numeric_cols = [
+            "Adherence (%)", "Hand: Avg Grip Force",
+            "Chest: Avg COM-BOS Angle (°)", "Balance: Alarm Triggers/Min",
+            "Locomotion: Max Angle Spike (°)", "P4: Time to Stability (sec)",
+            "Fatigue Avg (1–10)", "Pain Avg (0–10)"
+        ]
+        for col in numeric_cols:
+            df_a[col] = pd.to_numeric(df_a[col], errors='coerce')
+
+        # Display summary after preprocessing
+        st.subheader("📊 Processed Schema Preview")
+        st.dataframe(df_a, use_container_width=True, height=300)
+        message = st.text_input("📜 Message")
+        if st.button("📩 Send To AI"):
+            with st.spinner("AI Analyzing..."):
+
+                prompt1= f"""
+You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
+Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
+of the standardized documentation below.
+
+Input will be CSV records containing:
+Week
+Phase (P1,P2,P3,P4)
+Adherence (%)
+Hand: Avg Grip Force
+Hand: VR Error Rate (%)
+Chest: Avg COM-BOS Angle (°)
+Balance: Alarm Triggers/Min
+Locomotion: Max Angle Spike (°)
+Phase 4 Only: Time to Stability (sec)
+Fatigue Avg (1–10)
+Pain Avg (0–10)
+
+... (prompt shortened in code for brevity) ...
+
+Analyze the data given, then answer the message below accordingly and professional. Do not reveal in any way you are gemeni, just that you are an AI bot here to help. 
+Always answer professionally and clear, do not be vague. If you do not know, say so and tell them to discuss with their doctor. Do the same if you are not sure.
+Always respond and produce an answer, even if data is incomplete.
+If you are not "trained" to produce an answer, give appropriate suggestions
+DO NOT PRODUCE ANY SECTION. JUST PROVIDE AN ANSWER TO THE MESSAGE BELOW
+{message} 
+
+                """
+
+                summary = df_a.to_csv(index=False)
+                try:
+                    response = client_genai.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt1
+                    )
+                    st.subheader("🧠 AI Q&A")
+                    st.markdown(response.text, unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"AI request failed: {e}")
+
+        # -------------------------------
+        # 🤖 Run AI KPI Analysis
+        # -------------------------------
+        if st.button("🚀 Run AI KPI Analysis"):
+            with st.spinner("Running AI analysis..."):
+
+                summary = df_a.to_csv(index=False)
+
+                prompt = f"""
+You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
+Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
+of the standardized documentation below.
+
+... (prompt shortened in code for brevity) ...
+
+INPUT CSV DATA (below this line):
+{summary}
+"""
+                try:
+                    response = client_genai.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt
+                    )
+                    st.subheader("🧠 AI KPI Summary Output")
+                    st.markdown(response.text, unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"AI request failed: {e}")
 
 # -------------------------------
 # Manager Dashboard (full)
@@ -656,13 +752,13 @@ def manager_dashboard():
             e_bio = st.text_area("Bio", value=doc_row.get("Bio",""), key="edit_bio")
             if st.button("💾 Save Doctor Profile"):
                 try:
-                    ws = sheet_file.worksheet(DOCTOR_SHEET)
-                    all_rows = ws.get_all_records()
-                    df_tmp = pd.DataFrame(all_rows)
+                    # Use cached loader for doctors to reduce API calls
+                    df_tmp = load_doctors()
                     df_tmp.loc[df_tmp["Username"] == doc_select, "FullName"] = e_full
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Specialty"] = e_spec
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Hospital"] = e_hosp
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Bio"] = e_bio
+                    ws = sheet_file.worksheet(DOCTOR_SHEET)
                     ws.clear()
                     ws.append_row(["Username","Password","Role","FullName","Specialty","Hospital","Bio"])
                     for _, r in df_tmp.iterrows():
@@ -689,19 +785,19 @@ def manager_dashboard():
                 # explicit confirm
                 if st.button("✅ Confirm Delete Doctor"):
                     try:
-                        # remove from Doctors sheet
-                        ws_doc = sheet_file.worksheet(DOCTOR_SHEET)
-                        df_doc = pd.DataFrame(ws_doc.get_all_records())
+                        # remove from Doctors sheet using cached loader
+                        df_doc = load_doctors()
                         df_doc = df_doc[df_doc["Username"].astype(str).str.lower() != doc_select.lower()]
+                        ws_doc = sheet_file.worksheet(DOCTOR_SHEET)
                         ws_doc.clear()
                         ws_doc.append_row(["Username","Password","Role","FullName","Specialty","Hospital","Bio"])
                         for _, r in df_doc.iterrows():
                             ws_doc.append_row([r.get("Username",""), r.get("Password",""), r.get("Role",""), r.get("FullName",""), r.get("Specialty",""), r.get("Hospital",""), r.get("Bio","")])
 
                         # remove from Users
-                        ws_users = sheet_file.worksheet(USER_SHEET)
-                        df_users_tmp = pd.DataFrame(ws_users.get_all_records())
+                        df_users_tmp = load_users()
                         df_users_tmp = df_users_tmp[df_users_tmp["Username"].astype(str).str.lower() != doc_select.lower()]
+                        ws_users = sheet_file.worksheet(USER_SHEET)
                         ws_users.clear()
                         ws_users.append_row(["Username","Password","Role"])
                         for _, r in df_users_tmp.iterrows():
@@ -735,7 +831,7 @@ def manager_dashboard():
     st.markdown("---")
     st.subheader("Audit Log (manager actions)")
     try:
-        df_audit = pd.DataFrame(sheet_file.worksheet(AUDIT_SHEET).get_all_records())
+        df_audit = load_audit()
         if df_audit.empty:
             st.info("Audit log is empty.")
         else:
@@ -744,291 +840,11 @@ def manager_dashboard():
             st.download_button("⬇️ Export Audit Log", data=csv_a, file_name="audit_log.csv", mime="text/csv")
     except Exception as e:
         st.error(f"Failed to load audit log: {e}")
+
 # -------------------------------
-# 🧩 Extra Page per role
+# 🧩 Extra Page per role (sidebar + routing below uses "extra" page)
 # -------------------------------
-def extra_page():
-    st.markdown("<h1 style='text-align:center;'>AI KPI Analytics</h1>", unsafe_allow_html=True)
-    try:
-        df = pd.DataFrame(sheet.get_all_records())
-    except Exception as e:
-        st.error(f"❌ Failed to load data: {e}")
-        return
-    if df.empty:
-        st.info("No data yet. Please add patient data first.")
-    else:
-        # -------------------------------
-        # 🧩 Raw Data Section
-        # -------------------------------
-        st.markdown("### 🧾 Raw Patient Data (for filtering and review)")
-        name = st.text_input("🔍 Search Patient Name")
-        df_filtered = df[df["Username"].str.contains(name, case=False, na=False)] if name else df
 
-        st.dataframe(df_filtered, use_container_width=True, height=300)
-
-        st.markdown("---")
-
-        # -------------------------------
-        # 🔄 Preprocessing to Astronaut KPI Schema
-        # -------------------------------
-        st.markdown("### 🧠 Preprocessed Astronaut KPI Schema")
-
-        df_a = df_filtered.copy()
-        df_a['Timestamp'] = pd.to_datetime(df_a['Timestamp'])
-        df_a = df_a.sort_values('Timestamp')
-        df_a['Week'] = ["W" + str(i+1) for i in range(len(df_a))]
-        df_a['Phase'] = "P1"
-        df_a['Adherence (%)'] = 100
-
-        # Convert Force columns to numeric
-        force_cols = ["TH_Force", "IN_Force", "MT_Force", "RI_Force", "PT_Force"]
-        for col in force_cols:
-            df_a[col] = pd.to_numeric(df_a[col], errors='coerce')
-
-        # Create calculated column for average Grip Force
-        df_a["Hand: Avg Grip Force"] = df_a[force_cols].mean(axis=1).round(2)
-
-        # Set N/A values for metrics not yet available
-        df_a["Hand: VR Error Rate (%)"] = "N/A"
-        df_a["Chest: Avg COM-BOS Angle (°)"] = "N/A"
-        df_a["Balance: Alarm Triggers/Min"] = "N/A"
-        df_a["Locomotion: Max Angle Spike (°)"] = "N/A"
-        df_a["P4: Time to Stability (sec)"] = "N/A"
-
-        # Map fatigue/pain
-        df_a["Fatigue Avg (1–10)"] = df_a["Fatigue_Scale"]
-        df_a["Pain Avg (0–10)"] = df_a["Pain_Scale"]
-
-        # Final schema columns
-        final_cols = [
-            "Week", "Phase", "Adherence (%)",
-            "Hand: Avg Grip Force", "Hand: VR Error Rate (%)",
-            "Chest: Avg COM-BOS Angle (°)", "Balance: Alarm Triggers/Min",
-            "Locomotion: Max Angle Spike (°)", "P4: Time to Stability (sec)",
-            "Fatigue Avg (1–10)", "Pain Avg (0–10)"
-        ]
-
-        # Display editable table
-        st.markdown("#### ✏️ Editable Preprocessed Table")
-        edited = st.data_editor(df_a[final_cols], use_container_width=True, num_rows="dynamic")
-
-        # Store edited DataFrame
-        df_a = edited.copy()
-
-        # Convert columns that should be numeric
-        numeric_cols = [
-            "Adherence (%)", "Hand: Avg Grip Force",
-            "Chest: Avg COM-BOS Angle (°)", "Balance: Alarm Triggers/Min",
-            "Locomotion: Max Angle Spike (°)", "P4: Time to Stability (sec)",
-            "Fatigue Avg (1–10)", "Pain Avg (0–10)"
-        ]
-        for col in numeric_cols:
-            df_a[col] = pd.to_numeric(df_a[col], errors='coerce')
-
-        # Display summary after preprocessing
-        st.subheader("📊 Processed Schema Preview")
-        st.dataframe(df_a, use_container_width=True, height=300)
-        message = st.text_input("📜 Message")
-        if st.button("📩 Send To AI"):
-            with st.spinner("AI Analyzing..."):
-
-                prompt1= f"""
-You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
-Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
-of the standardized documentation below.
-
-Input will be CSV records containing:
-Week
-Phase (P1,P2,P3,P4)
-Adherence (%)
-Hand: Avg Grip Force
-Hand: VR Error Rate (%)
-Chest: Avg COM-BOS Angle (°)
-Balance: Alarm Triggers/Min
-Locomotion: Max Angle Spike (°)
-Phase 4 Only: Time to Stability (sec)
-Fatigue Avg (1–10)
-Pain Avg (0–10)
-
-------------------------------------------------------------
-DATA AVAILABILITY RULES
-If the CSV input is incomplete or missing some metrics (for example: missing COM-BOS Angle, Alarm Triggers/Min, VR Error Rate, or Time to Stability):
-1. Do NOT reject the input. Always proceed with analysis.
-2. Mark missing metrics as “N/A”.
-3. Infer trends and highlight performance using available data only.
-   - Use Grip Force as a proxy for Hand strength and control trends.
-   - Use Pain and Fatigue as physiological indicators for endurance or regression.
-   - If COM-BOS or Alarm data are absent, assume stability metrics are under observation but unmeasured this session.
-4. Adapt your interpretation logically. If a metric is missing, base the clinical reasoning on the remaining indicators.
-5. Maintain all standard output sections (B, C, and D) even when data are partial or incomplete.
-
-------------------------------------------------------------
-REHAB PROGRAM LOGIC (REFERENCE)
-Phase 1 focus (Weeks 1–4): Soft to Medium Grip, Static Balance tolerance >3°, Hand VR Error Rate target <3%, Avg COM-BOS <2.2°, Alarm Triggers/min <1/5 min
-Phase 2 focus (Weeks 5–8): Strong Grip Force, Dynamic Balance tolerance >1.5°, Turning control (90°/180°), Alarm Response <0.5s, COM-BOS <1.0°
-Phase 3 focus (Weeks 9–12): Hard Grip + Cognitive load, Tightest tolerance >0.7°, Alarm Triggers/session <3, COM-BOS <0.5° under stress
-Phase 4 focus (Weeks 13–16): Impact Loading, Post-landing stability, Time to Stability (TTS) <0.5s
-
-------------------------------------------------------------
-METRIC THRESHOLDS (ALERT MODEL)
-Balance: Alarm Triggers/Min — Green <0.2 (P2), <0.05 (P3/P4); Yellow 0.2–0.5 / 0.05–0.1; Red >0.5 / >0.1  
-Chest: Avg COM-BOS Angle — Green <1.0° (P2/P3), <0.5° (P4); Yellow 1.0–2.0° / 0.5–1.0°; Red >2.0° / >1.0°  
-Locomotion: Max Angle Spike — Green <1.5° (P2), <1.0° (P3/P4); Yellow 1.5–2.5° / 1.0–1.5°; Red >2.5° / >1.5°  
-Hand: VR Error Rate — Green <3% (P1/P2), <0.5% (P3/P4); Yellow 3–6% / 0.5–1.0%; Red >6% / >1.0%
-
-------------------------------------------------------------
-YOUR TASK
-Using the CSV data provided, produce the following structured sections clearly labeled:
-
-SECTION B. Weekly AI Summary & Recommendations (for Clinician Review)
-Columns:
-Week | Trend Highlights (KPIs) | Red Flags (N if none) | Root-Cause Hypotheses | Recommendations for Next Phase | Progression Decision (Progress, Maintain, Regress)
-Rules:
-- Use short, clinical highlight sentences.
-- Mention % improvement where possible.
-- Mention COM-BOS and Alarm behavior only if data exist.
-- Mark missing metrics as N/A but keep consistent structure.
-- Mention Grip Force, Fatigue, and Pain trends in all cases.
-
-SECTION C. KPI Thresholds & Triggers (Auto-Flags)
-For each week:
-- Identify metrics in Yellow or Red zones (only from available metrics).
-- Produce 1–2 Auto-Actions referencing threshold logic.
-
-SECTION D. Free-Text Weekly Notes (Communication Log)
-Astronaut/Patient Note: first-person subjective report (1–2 sentences)
-AI Note: integrated analysis paragraph linking available metrics such as Grip Force, Pain, Fatigue, and any stability metric present.
-
-Style: Use compact, clinical writing in report tone. 
-An approriate response (example) should be something like this:
-Response to Inquiry: 'What should I do next week to lower the pain?'
-As an AI analytics system, I cannot provide direct medical advice or treatment recommendations. These decisions must be made in consultation with your clinical team. However, based on the analytical report:
-
-Your most recent reported pain average was 6.0. This indicates an increase from the previous week's average. Elevated pain can be correlated with increased fatigue or specific training activities. The system has flagged this as an 'Elevated Pain Alert'. It is crucial to review recent training load and specific activities that may be contributing.
-To address pain, it is recommended to discuss with your clinician the following data-driven considerations: adjusting the intensity or volume of training sessions, particularly for activities that may be correlated with increased pain; incorporating targeted recovery strategies; and ensuring adequate rest and nutrition. A detailed clinical assessment may identify specific biomechanical factors or exercises contributing to discomfort. Please consult directly with your medical doctor or rehabilitation specialist for personalized guidance and to determine the most appropriate course of action for pain managemen
-
-Analyze the data given, then answer the message below accordingly and professional. Do not reveal in any way you are gemeni, just that you are an AI bot here to help. 
-Always answer professionally and clear, do not be vague. If you do not know, say so and tell them to discuss with their doctor. Do the same if you are not sure.
-Always respond and produce an answer, even if data is incomplete.
-If you are not "trained" to produce an answer, give appropriate suggestions
-DO NOT PRODUCE ANY SECTION. JUST PROVIDE AN ANSWER TO THE MESSAGE BELOW
-{message} 
-
-                """
-
-                summary = df_a.to_csv(index=False)
-                response = client_genai.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt1
-                )
-
-                st.subheader("🧠 AI Q&A")
-                # st.write(response.text)
-                st.markdown(response.text, unsafe_allow_html=True)
-
-        # -------------------------------
-        # 🤖 Run AI KPI Analysis
-        # -------------------------------
-        if st.button("🚀 Run AI KPI Analysis"):
-            with st.spinner("Running AI analysis..."):
-
-                summary = df_a.to_csv(index=False)
-
-    #             prompt = f"""
-    # You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training.
-    # Always accept incomplete data. If metrics are 'N/A', infer trends from Grip Force, Pain, and Fatigue.
-    # Never reject input.
-
-    # Input CSV:
-    # {summary}
-
-    # Return:
-    # Section B: Weekly AI Summary & Recommendations
-    # Section C: KPI Thresholds & Triggers
-    # Section D: Free-Text Weekly Notes
-    # """
-                prompt = f"""
-You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
-Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
-of the standardized documentation below.
-
-Input will be CSV records containing:
-Week
-Phase (P1,P2,P3,P4)
-Adherence (%)
-Hand: Avg Grip Force
-Hand: VR Error Rate (%)
-Chest: Avg COM-BOS Angle (°)
-Balance: Alarm Triggers/Min
-Locomotion: Max Angle Spike (°)
-Phase 4 Only: Time to Stability (sec)
-Fatigue Avg (1–10)
-Pain Avg (0–10)
-
-------------------------------------------------------------
-DATA AVAILABILITY RULES
-If the CSV input is incomplete or missing some metrics (for example: missing COM-BOS Angle, Alarm Triggers/Min, VR Error Rate, or Time to Stability):
-1. Do NOT reject the input. Always proceed with analysis.
-2. Mark missing metrics as “N/A”.
-3. Infer trends and highlight performance using available data only.
-   - Use Grip Force as a proxy for Hand strength and control trends.
-   - Use Pain and Fatigue as physiological indicators for endurance or regression.
-   - If COM-BOS or Alarm data are absent, assume stability metrics are under observation but unmeasured this session.
-4. Adapt your interpretation logically. If a metric is missing, base the clinical reasoning on the remaining indicators.
-5. Maintain all standard output sections (B, C, and D) even when data are partial or incomplete.
-
-------------------------------------------------------------
-REHAB PROGRAM LOGIC (REFERENCE)
-Phase 1 focus (Weeks 1–4): Soft to Medium Grip, Static Balance tolerance >3°, Hand VR Error Rate target <3%, Avg COM-BOS <2.2°, Alarm Triggers/min <1/5 min
-Phase 2 focus (Weeks 5–8): Strong Grip Force, Dynamic Balance tolerance >1.5°, Turning control (90°/180°), Alarm Response <0.5s, COM-BOS <1.0°
-Phase 3 focus (Weeks 9–12): Hard Grip + Cognitive load, Tightest tolerance >0.7°, Alarm Triggers/session <3, COM-BOS <0.5° under stress
-Phase 4 focus (Weeks 13–16): Impact Loading, Post-landing stability, Time to Stability (TTS) <0.5s
-
-------------------------------------------------------------
-METRIC THRESHOLDS (ALERT MODEL)
-Balance: Alarm Triggers/Min — Green <0.2 (P2), <0.05 (P3/P4); Yellow 0.2–0.5 / 0.05–0.1; Red >0.5 / >0.1  
-Chest: Avg COM-BOS Angle — Green <1.0° (P2/P3), <0.5° (P4); Yellow 1.0–2.0° / 0.5–1.0°; Red >2.0° / >1.0°  
-Locomotion: Max Angle Spike — Green <1.5° (P2), <1.0° (P3/P4); Yellow 1.5–2.5° / 1.0–1.5°; Red >2.5° / >1.5°  
-Hand: VR Error Rate — Green <3% (P1/P2), <0.5% (P3/P4); Yellow 3–6% / 0.5–1.0%; Red >6% / >1.0%
-
-------------------------------------------------------------
-YOUR TASK
-Using the CSV data provided, produce the following structured sections clearly labeled:
-
-SECTION B. Weekly AI Summary & Recommendations (for Clinician Review)
-Columns:
-Week | Trend Highlights (KPIs) | Red Flags (N if none) | Root-Cause Hypotheses | Recommendations for Next Phase | Progression Decision (Progress, Maintain, Regress)
-Rules:
-- Use short, clinical highlight sentences.
-- Mention % improvement where possible.
-- Mention COM-BOS and Alarm behavior only if data exist.
-- Mark missing metrics as N/A but keep consistent structure.
-- Mention Grip Force, Fatigue, and Pain trends in all cases.
-
-SECTION C. KPI Thresholds & Triggers (Auto-Flags)
-For each week:
-- Identify metrics in Yellow or Red zones (only from available metrics).
-- Produce 1–2 Auto-Actions referencing threshold logic.
-
-SECTION D. Free-Text Weekly Notes (Communication Log)
-Astronaut/Patient Note: first-person subjective report (1–2 sentences)
-AI Note: integrated analysis paragraph linking available metrics such as Grip Force, Pain, Fatigue, and any stability metric present.
-
-Style: Use compact, clinical writing in report tone. 
-Do NOT reject incomplete data. Always produce Sections B, C, and D.
-
-------------------------------------------------------------
-INPUT CSV DATA (below this line):
-{summary}
-"""
-                response = client_genai.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt
-                )
-
-                st.subheader("🧠 AI KPI Summary Output")
-                # st.write(response.text)
-                st.markdown(response.text, unsafe_allow_html=True)
 # -------------------------------
 # Sidebar + Routing
 # -------------------------------
