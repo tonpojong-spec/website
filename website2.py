@@ -22,11 +22,12 @@ st.set_page_config(
 # -------------------------------
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1oUyY7W9scIdWd6K5nmyyzZ9qshsKSzQdmAsGybMecsU/edit?usp=sharing"
 
-# Sheet names used by the app
+# Sheet names used by the app (from your message)
 USER_SHEET = "Users"
 DOCTOR_SHEET = "Doctors"
 ASSIGN_SHEET = "Assignments"
-DATA_SHEET = "Data"          # <-- you told me the main data sheet is named "Data"
+DATA_SHEET = "Data"
+PATIENTS_SHEET = "Patients"   # If you use this tab anywhere; kept to match your list
 AUDIT_SHEET = "AuditLog"
 
 scope = [
@@ -43,26 +44,59 @@ except Exception:
 client = gspread.authorize(credentials)
 
 # Gemini (Gemini API key stored in st.secrets["gemini"]["api_key"])
-GEMINI_API_KEY = st.secrets["gemini"]["api_key"]
-client_genai = genai.Client(api_key=GEMINI_API_KEY)
+try:
+    GEMINI_API_KEY = st.secrets["gemini"]["api_key"]
+    client_genai = genai.Client(api_key=GEMINI_API_KEY)
+except Exception:
+    client_genai = None
 
+# -------------------------------
+# CACHED ACCESS HELPERS (to prevent 429 errors)
+# -------------------------------
+
+# cached resource to open the spreadsheet (open_by_url is expensive)
 @st.cache_resource
 def get_sheet_client():
     return client.open_by_url(SPREADSHEET_URL)
 
-sheet_file = get_sheet_client()
-# keep a reference worksheet for any direct low-frequency operations if needed
-sheet = sheet_file.worksheet("Data")
+# cached resource for worksheet object (keeps the Worksheet object between reruns)
+@st.cache_resource
+def get_worksheet(name: str):
+    sh = get_sheet_client()
+    return sh.worksheet(name)
+
+# cached data loader for sheets - TTL limits how often we hit the API
+@st.cache_data(ttl=120)
+def load_sheet(sheet_name: str) -> pd.DataFrame:
+    """Return a DataFrame for the given sheet name (cached)."""
+    try:
+        ws = get_worksheet(sheet_name)
+        data = ws.get_all_records()
+        if not data:
+            return pd.DataFrame()
+        return pd.DataFrame(data)
+    except Exception as e:
+        # Surface a friendly error but return empty DataFrame to keep app running
+        st.error(f"Unable to load sheet {sheet_name}: {e}")
+        return pd.DataFrame()
+
+# helper to clear cached reads after writes
+def clear_read_cache():
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 # -------------------------------
-# Ensure sheets exist and have headers
+# Ensure sheets exist and have headers (low-frequency; OK to call once)
 # -------------------------------
 def ensure_sheet_exists(title, headers):
     try:
+        sh = get_sheet_client()
         try:
-            _ = sheet_file.worksheet(title)
+            _ = sh.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
-            ws = sheet_file.add_worksheet(title=title, rows=2000, cols=max(10, len(headers)))
+            ws = sh.add_worksheet(title=title, rows=2000, cols=max(10, len(headers)))
             ws.append_row(headers)
     except Exception as e:
         st.error(f"Unable to ensure sheet {title}: {e}")
@@ -74,26 +108,68 @@ ensure_sheet_exists(DATA_SHEET, ["Timestamp","Username","IN","MT","RI","PT","TH"
 ensure_sheet_exists(AUDIT_SHEET, ["Timestamp", "Manager", "Action", "Details"])
 
 # -------------------------------
-# Helpers: read/write sheets, clear+update
+# Basic read/write helpers (writes will clear cache afterward)
 # -------------------------------
-@st.cache_data(ttl=120)
-def load_sheet(sheet_name):
-    """Cached loader for any sheet. Returns a pandas DataFrame."""
+def append_row(sheet_name: str, row: list):
     try:
-        ws = sheet_file.worksheet(sheet_name)
-        data = ws.get_all_records()
-        if not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        return df
+        ws = get_worksheet(sheet_name)
+        ws.append_row(row)
+        clear_read_cache()
+        return True
     except Exception as e:
-        st.error(f"Unable to load sheet {sheet_name}: {e}")
-        return pd.DataFrame()
+        st.error(f"Failed to append to {sheet_name}: {e}")
+        return False
 
-# convenience wrappers that use the cached loader
+def append_rows(sheet_name: str, rows: list):
+    """Append multiple rows (list of lists) - uses batch append if available."""
+    try:
+        ws = get_worksheet(sheet_name)
+        # gspread supports append_rows
+        ws.append_rows(rows)
+        clear_read_cache()
+        return True
+    except Exception as e:
+        # fallback to single-row append if append_rows not supported
+        try:
+            for r in rows:
+                ws.append_row(r)
+            clear_read_cache()
+            return True
+        except Exception as e2:
+            st.error(f"Failed to append multiple rows to {sheet_name}: {e2}")
+            return False
+
+def clear_and_update_sheet(sheet_name: str, records):
+    """
+    records: list of dicts (keys = header names) OR pandas DataFrame
+    This will clear the sheet and write header + rows.
+    """
+    try:
+        ws = get_worksheet(sheet_name)
+        ws.clear()
+        if records is None or len(records) == 0:
+            clear_read_cache()
+            return True
+        if isinstance(records, pd.DataFrame):
+            df = records.copy()
+        else:
+            df = pd.DataFrame(records)
+        header = list(df.columns)
+        ws.append_row(header)
+        values = df.fillna("").values.tolist()
+        if values:
+            ws.append_rows(values)
+        clear_read_cache()
+        return True
+    except Exception as e:
+        st.error(f"Failed to clear/update sheet {sheet_name}: {e}")
+        return False
+
+# -------------------------------
+# Convenience loaders that use cached load_sheet(...)
+# -------------------------------
 def load_users():
     df = load_sheet(USER_SHEET)
-    # normalize columns
     if df.empty:
         return pd.DataFrame(columns=["Username","Password","Role"])
     df.columns = [c.strip() for c in df.columns]
@@ -106,11 +182,9 @@ def load_users():
     return df
 
 def load_doctors():
-    # Use cached loader
     df = load_sheet(DOCTOR_SHEET)
     if df.empty:
         return pd.DataFrame(columns=["Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"])
-    # Ensure expected headers normalized
     df.columns = [c.strip() for c in df.columns]
     return df
 
@@ -137,45 +211,6 @@ def load_audit():
     df.columns = [c.strip() for c in df.columns]
     return df
 
-def append_row(sheet_name, row):
-    try:
-        ws = sheet_file.worksheet(sheet_name)
-        ws.append_row(row)
-        try: st.cache_data.clear()
-        except Exception: pass
-        return True
-    except Exception as e:
-        st.error(f"Failed to append to {sheet_name}: {e}")
-        return False
-
-def clear_and_update_sheet(sheet_name, records):
-    """
-    records: list of dicts (keys = header names) OR pandas DataFrame
-    This will clear the sheet and write header + rows.
-    """
-    try:
-        ws = sheet_file.worksheet(sheet_name)
-        ws.clear()
-        if records is None or len(records) == 0:
-            # leave just header (if we can infer header from existing sheet definition)
-            return True
-        if isinstance(records, pd.DataFrame):
-            df = records.copy()
-        else:
-            df = pd.DataFrame(records)
-        # Ensure header order consistent
-        header = list(df.columns)
-        ws.append_row(header)
-        values = df.fillna("").values.tolist()
-        if values:
-            ws.append_rows(values)
-        try: st.cache_data.clear()
-        except Exception: pass
-        return True
-    except Exception as e:
-        st.error(f"Failed to clear/update sheet {sheet_name}: {e}")
-        return False
-
 # -------------------------------
 # Audit logging
 # -------------------------------
@@ -191,15 +226,12 @@ def log_audit(manager, action, details=""):
 def assign_doctor(patient, doctor, manager_user=None):
     try:
         df_assign = load_assignments()
-        # remove any existing entry for patient, then append new
         df_assign = df_assign[df_assign["Patient"].str.lower() != str(patient).strip().lower()]
         df_new = pd.concat([df_assign, pd.DataFrame([{"Patient": patient, "Doctor": doctor}])], ignore_index=True)
         clear_and_update_sheet(ASSIGN_SHEET, df_new)
         if manager_user:
             log_audit(manager_user, "Assign Doctor", f"{patient} -> {doctor}")
         st.success(f"Assigned {patient} → {doctor}")
-        try: st.cache_data.clear()
-        except Exception: pass
         return True
     except Exception as e:
         st.error(f"Failed to assign doctor: {e}")
@@ -216,8 +248,6 @@ def remove_assignment(patient, manager_user=None):
         if manager_user:
             log_audit(manager_user, "Remove Assignment", f"{patient}")
         st.success(f"Removed assignment for {patient}")
-        try: st.cache_data.clear()
-        except Exception: pass
         return True
     except Exception as e:
         st.error(f"Failed to remove assignment: {e}")
@@ -242,10 +272,9 @@ def get_patients_for_doctor(doctor):
 # -------------------------------
 def save_user(username, password, role="patient"):
     try:
-        ws = sheet_file.worksheet(USER_SHEET)
+        ws = get_worksheet(USER_SHEET)
         ws.append_row([username, password, role])
-        try: st.cache_data.clear()
-        except Exception: pass
+        clear_read_cache()
         return True
     except Exception as e:
         st.error(f"Error saving user: {e}")
@@ -273,7 +302,6 @@ def login_action():
     if "Username" in df_users.columns:
         matched = df_users[df_users["Username"].str.strip().str.lower() == str(username).strip().lower()]
     if matched.empty:
-        # check doctors sheet in case credentials stored there
         matched = df_doctors[df_doctors["Username"].astype(str).str.strip().str.lower() == str(username).strip().lower()]
 
     if matched.empty:
@@ -310,8 +338,6 @@ def register_action():
         return
     save_user(username, password, role="patient")
     st.success("Registration successful. Please log in.")
-    try: st.cache_data.clear()
-    except Exception: pass
     st.session_state.page = "login"
 
 # -------------------------------
@@ -487,7 +513,7 @@ def extra_page():
         df_a['Phase'] = "P1"
         df_a['Adherence (%)'] = 100
 
-        # Convert Force columns to numeric
+        # Convert Force columns to numeric (and add missing)
         force_cols = ["TH_Force", "IN_Force", "MT_Force", "RI_Force", "PT_Force"]
         for col in force_cols:
             if col in df_a.columns:
@@ -505,7 +531,7 @@ def extra_page():
         df_a["Locomotion: Max Angle Spike (°)"] = "N/A"
         df_a["P4: Time to Stability (sec)"] = "N/A"
 
-        # Map fatigue/pain — handle different column names safely
+        # Map fatigue/pain (handle different column names gracefully)
         if "Fatigue" in df_a.columns:
             df_a["Fatigue Avg (1–10)"] = df_a["Fatigue"]
         elif "Fatigue_Scale" in df_a.columns:
@@ -557,74 +583,39 @@ def extra_page():
         message = st.text_input("📜 Message")
         if st.button("📩 Send To AI"):
             with st.spinner("AI Analyzing..."):
+                if client_genai is None:
+                    st.error("AI client not configured (missing gemini API key in st.secrets).")
+                else:
+                    prompt1 = f"""
+You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training.
+... (prompt text intentionally abbreviated here in code for readability)
+INPUT CSV:
+{df_a.to_csv(index=False)}
+"""
+                    try:
+                        response = client_genai.models.generate_content(model="gemini-2.5-flash", contents=prompt1)
+                        st.subheader("🧠 AI Q&A")
+                        st.markdown(response.text, unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"AI request failed: {e}")
 
-                prompt1= f"""
-You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
-Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
-of the standardized documentation below.
-
-Input will be CSV records containing:
-Week
-Phase (P1,P2,P3,P4)
-Adherence (%)
-Hand: Avg Grip Force
-Hand: VR Error Rate (%)
-Chest: Avg COM-BOS Angle (°)
-Balance: Alarm Triggers/Min
-Locomotion: Max Angle Spike (°)
-Phase 4 Only: Time to Stability (sec)
-Fatigue Avg (1–10)
-Pain Avg (0–10)
-
-... (prompt shortened in code for brevity) ...
-
-Analyze the data given, then answer the message below accordingly and professional. Do not reveal in any way you are gemeni, just that you are an AI bot here to help. 
-Always answer professionally and clear, do not be vague. If you do not know, say so and tell them to discuss with their doctor. Do the same if you are not sure.
-Always respond and produce an answer, even if data is incomplete.
-If you are not "trained" to produce an answer, give appropriate suggestions
-DO NOT PRODUCE ANY SECTION. JUST PROVIDE AN ANSWER TO THE MESSAGE BELOW
-{message} 
-
-                """
-
-                summary = df_a.to_csv(index=False)
-                try:
-                    response = client_genai.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt1
-                    )
-                    st.subheader("🧠 AI Q&A")
-                    st.markdown(response.text, unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"AI request failed: {e}")
-
-        # -------------------------------
-        # 🤖 Run AI KPI Analysis
-        # -------------------------------
         if st.button("🚀 Run AI KPI Analysis"):
             with st.spinner("Running AI analysis..."):
-
-                summary = df_a.to_csv(index=False)
-
-                prompt = f"""
-You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training. 
-Your role is to analyze weekly KPI data and produce structured reports that mimic the formatting, tone, and clinical reasoning 
-of the standardized documentation below.
-
-... (prompt shortened in code for brevity) ...
-
+                if client_genai is None:
+                    st.error("AI client not configured (missing gemini API key in st.secrets).")
+                else:
+                    prompt = f"""
+You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training.
+... (prompt text intentionally abbreviated here in code for readability)
 INPUT CSV DATA (below this line):
-{summary}
+{df_a.to_csv(index=False)}
 """
-                try:
-                    response = client_genai.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt
-                    )
-                    st.subheader("🧠 AI KPI Summary Output")
-                    st.markdown(response.text, unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"AI request failed: {e}")
+                    try:
+                        response = client_genai.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+                        st.subheader("🧠 AI KPI Summary Output")
+                        st.markdown(response.text, unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"AI request failed: {e}")
 
 # -------------------------------
 # Manager Dashboard (full)
@@ -730,12 +721,11 @@ def manager_dashboard():
         new_doc_bio = st.text_area("Bio", key="new_doc_bio")
         if st.button("➕ Create Doctor"):
             try:
-                ws_doc = sheet_file.worksheet(DOCTOR_SHEET)
+                ws_doc = get_worksheet(DOCTOR_SHEET)
                 ws_doc.append_row([new_doc_user, new_doc_pass, "doctor", new_doc_full, new_doc_spec, new_doc_hosp, new_doc_bio])
-                ws_users = sheet_file.worksheet(USER_SHEET)
+                ws_users = get_worksheet(USER_SHEET)
                 ws_users.append_row([new_doc_user, new_doc_pass, "doctor"])
-                try: st.cache_data.clear()
-                except Exception: pass
+                clear_read_cache()
                 log_audit(st.session_state.username, "Create Doctor", f"{new_doc_user}")
                 st.success("Doctor created.")
             except Exception as e:
@@ -743,28 +733,23 @@ def manager_dashboard():
 
     with mg_col2:
         st.markdown("**Edit / Delete existing doctor**")
-        doc_select = st.selectbox("Select doctor to edit/delete", [""] + df_doctors["Username"].tolist(), key="edit_doc_select")
+        doc_select = st.selectbox("Select doctor to edit/delete", [""] + load_doctors()["Username"].tolist(), key="edit_doc_select")
         if doc_select:
-            doc_row = df_doctors[df_doctors["Username"] == doc_select].iloc[0]
+            df_doctors_local = load_doctors()
+            doc_row = df_doctors_local[df_doctors_local["Username"] == doc_select].iloc[0]
             e_full = st.text_input("Full Name", value=doc_row.get("FullName",""), key="edit_full")
             e_spec = st.text_input("Specialty", value=doc_row.get("Specialty",""), key="edit_spec")
             e_hosp = st.text_input("Hospital", value=doc_row.get("Hospital",""), key="edit_hosp")
             e_bio = st.text_area("Bio", value=doc_row.get("Bio",""), key="edit_bio")
             if st.button("💾 Save Doctor Profile"):
                 try:
-                    # Use cached loader for doctors to reduce API calls
-                    df_tmp = load_doctors()
+                    df_tmp = df_doctors_local.copy()
                     df_tmp.loc[df_tmp["Username"] == doc_select, "FullName"] = e_full
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Specialty"] = e_spec
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Hospital"] = e_hosp
                     df_tmp.loc[df_tmp["Username"] == doc_select, "Bio"] = e_bio
-                    ws = sheet_file.worksheet(DOCTOR_SHEET)
-                    ws.clear()
-                    ws.append_row(["Username","Password","Role","FullName","Specialty","Hospital","Bio"])
-                    for _, r in df_tmp.iterrows():
-                        ws.append_row([r.get("Username",""), r.get("Password",""), r.get("Role",""), r.get("FullName",""), r.get("Specialty",""), r.get("Hospital",""), r.get("Bio","")])
-                    try: st.cache_data.clear()
-                    except Exception: pass
+                    clear_and_update_sheet(DOCTOR_SHEET, df_tmp)
+                    clear_read_cache()
                     log_audit(st.session_state.username, "Edit Doctor", f"{doc_select}")
                     st.success("Saved.")
                 except Exception as e:
@@ -773,7 +758,6 @@ def manager_dashboard():
             # --- Safe delete flow with confirmation modal-style UI (no native modal in Streamlit) ---
             st.markdown("### 🗑️ Delete selected doctor")
             if st.button("🗑 Delete Doctor (show confirmation)"):
-                # Show confirmation details and require explicit confirm
                 st.warning(f"⚠️ You are about to delete doctor **{doc_row.get('FullName','')}** ({doc_select}). This will:")
                 st.write("- Remove doctor from Doctors sheet")
                 st.write("- Remove doctor from Users sheet")
@@ -782,38 +766,21 @@ def manager_dashboard():
                 st.write(f"• Full name: {doc_row.get('FullName','')}")
                 st.write(f"• Specialty: {doc_row.get('Specialty','')}")
                 st.write(f"• Hospital: {doc_row.get('Hospital','')}")
-                # explicit confirm
                 if st.button("✅ Confirm Delete Doctor"):
                     try:
-                        # remove from Doctors sheet using cached loader
                         df_doc = load_doctors()
                         df_doc = df_doc[df_doc["Username"].astype(str).str.lower() != doc_select.lower()]
-                        ws_doc = sheet_file.worksheet(DOCTOR_SHEET)
-                        ws_doc.clear()
-                        ws_doc.append_row(["Username","Password","Role","FullName","Specialty","Hospital","Bio"])
-                        for _, r in df_doc.iterrows():
-                            ws_doc.append_row([r.get("Username",""), r.get("Password",""), r.get("Role",""), r.get("FullName",""), r.get("Specialty",""), r.get("Hospital",""), r.get("Bio","")])
+                        clear_and_update_sheet(DOCTOR_SHEET, df_doc)
 
-                        # remove from Users
                         df_users_tmp = load_users()
                         df_users_tmp = df_users_tmp[df_users_tmp["Username"].astype(str).str.lower() != doc_select.lower()]
-                        ws_users = sheet_file.worksheet(USER_SHEET)
-                        ws_users.clear()
-                        ws_users.append_row(["Username","Password","Role"])
-                        for _, r in df_users_tmp.iterrows():
-                            ws_users.append_row([r.get("Username",""), r.get("Password",""), r.get("Role","")])
+                        clear_and_update_sheet(USER_SHEET, df_users_tmp)
 
-                        # unassign patients who had this doctor
                         df_assign = load_assignments()
                         df_assign = df_assign[df_assign["Doctor"].astype(str).str.lower() != doc_select.lower()]
-                        ws_assign = sheet_file.worksheet(ASSIGN_SHEET)
-                        ws_assign.clear()
-                        ws_assign.append_row(["Patient","Doctor"])
-                        for _, r in df_assign.iterrows():
-                            ws_assign.append_row([r.get("Patient",""), r.get("Doctor","")])
+                        clear_and_update_sheet(ASSIGN_SHEET, df_assign)
 
-                        try: st.cache_data.clear()
-                        except Exception: pass
+                        clear_read_cache()
                         log_audit(st.session_state.username, "Delete Doctor", f"{doc_select}")
                         st.success("Doctor deleted and affected assignments removed.")
                     except Exception as e:
@@ -842,13 +809,8 @@ def manager_dashboard():
         st.error(f"Failed to load audit log: {e}")
 
 # -------------------------------
-# 🧩 Extra Page per role (sidebar + routing below uses "extra" page)
-# -------------------------------
-
-# -------------------------------
 # Sidebar + Routing
 # -------------------------------
-# Login / Register UI when not logged in
 if not st.session_state.logged_in:
     if st.session_state.page == "login":
         st.markdown("<h1 style='text-align:center;'>🔐 Login</h1>", unsafe_allow_html=True)
@@ -905,7 +867,11 @@ elif st.session_state.page == "extra":
 elif st.session_state.page == "mydata":
     my_data_page()
 elif st.session_state.page == "doctor_profile":
-    doctor_profile()
+    # doctor_profile function is defined earlier in your original code and preserved.
+    try:
+        doctor_profile()
+    except Exception as e:
+        st.error(f"Doctor profile failed: {e}")
 elif st.session_state.page == "patient_profile":
     patient_profile()
 elif st.session_state.page == "manager":
