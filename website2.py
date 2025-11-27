@@ -27,7 +27,7 @@ USER_SHEET = "Users"
 DOCTOR_SHEET = "Doctors"
 ASSIGN_SHEET = "Assignments"
 DATA_SHEET = "Data"
-PATIENTS_SHEET = "Patients"   # If you use this tab anywhere; kept to match your list
+PROFILES_SHEET = "Profiles"
 AUDIT_SHEET = "AuditLog"
 
 scope = [
@@ -54,18 +54,16 @@ except Exception:
 # CACHED ACCESS HELPERS (to prevent 429 errors)
 # -------------------------------
 
-# cached resource to open the spreadsheet (open_by_url is expensive)
 @st.cache_resource
 def get_sheet_client():
+    # open_by_url is used to avoid lookup by name
     return client.open_by_url(SPREADSHEET_URL)
 
-# cached resource for worksheet object (keeps the Worksheet object between reruns)
 @st.cache_resource
 def get_worksheet(name: str):
     sh = get_sheet_client()
     return sh.worksheet(name)
 
-# cached data loader for sheets - TTL limits how often we hit the API
 @st.cache_data(ttl=120)
 def load_sheet(sheet_name: str) -> pd.DataFrame:
     """Return a DataFrame for the given sheet name (cached)."""
@@ -74,13 +72,14 @@ def load_sheet(sheet_name: str) -> pd.DataFrame:
         data = ws.get_all_records()
         if not data:
             return pd.DataFrame()
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        # normalize column names (strip)
+        df.columns = [c.strip() for c in df.columns]
+        return df
     except Exception as e:
-        # Surface a friendly error but return empty DataFrame to keep app running
         st.error(f"Unable to load sheet {sheet_name}: {e}")
         return pd.DataFrame()
 
-# helper to clear cached reads after writes
 def clear_read_cache():
     try:
         st.cache_data.clear()
@@ -101,10 +100,11 @@ def ensure_sheet_exists(title, headers):
     except Exception as e:
         st.error(f"Unable to ensure sheet {title}: {e}")
 
-ensure_sheet_exists(USER_SHEET, ["Username", "Password", "Role"])
+ensure_sheet_exists(USER_SHEET, ["Username", "Password", "Role", "Name", "Age", "Gender", "Condition"])
 ensure_sheet_exists(DOCTOR_SHEET, ["Username", "Password", "Role", "FullName", "Specialty", "Hospital", "Bio"])
 ensure_sheet_exists(ASSIGN_SHEET, ["Patient", "Doctor"])
-ensure_sheet_exists(DATA_SHEET, ["Timestamp","Username","IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue","Notes"])
+ensure_sheet_exists(DATA_SHEET, ["Timestamp","Username","IN","MT","RI","PT","TH","TH_Force","IN_Force","MT_Force","RI_Force","PT_Force","Pain_Scale","Fatigue_Scale"])
+ensure_sheet_exists(PROFILES_SHEET, ["Username", "Name", "Age", "Condition", "Specialization", "Role"])
 ensure_sheet_exists(AUDIT_SHEET, ["Timestamp", "Manager", "Action", "Details"])
 
 # -------------------------------
@@ -121,15 +121,12 @@ def append_row(sheet_name: str, row: list):
         return False
 
 def append_rows(sheet_name: str, rows: list):
-    """Append multiple rows (list of lists) - uses batch append if available."""
     try:
         ws = get_worksheet(sheet_name)
-        # gspread supports append_rows
         ws.append_rows(rows)
         clear_read_cache()
         return True
     except Exception as e:
-        # fallback to single-row append if append_rows not supported
         try:
             for r in rows:
                 ws.append_row(r)
@@ -171,7 +168,7 @@ def clear_and_update_sheet(sheet_name: str, records):
 def load_users():
     df = load_sheet(USER_SHEET)
     if df.empty:
-        return pd.DataFrame(columns=["Username","Password","Role"])
+        return pd.DataFrame(columns=["Username","Password","Role","Name","Age","Gender","Condition"])
     df.columns = [c.strip() for c in df.columns]
     if "Role" in df.columns:
         df["Role"] = df["Role"].astype(str).str.strip().str.lower()
@@ -200,7 +197,21 @@ def load_assignments():
 def load_data():
     df = load_sheet(DATA_SHEET)
     if df.empty:
-        return pd.DataFrame(columns=["Timestamp","Username","IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue","Notes"])
+        return pd.DataFrame(columns=["Timestamp","Username","IN","MT","RI","PT","TH","TH_Force","IN_Force","MT_Force","RI_Force","PT_Force","Pain_Scale","Fatigue_Scale"])
+    df.columns = [c.strip() for c in df.columns]
+
+    # Convert the sheet's Pain_Scale / Fatigue_Scale to internal Pain / Fatigue fields
+    if "Pain_Scale" in df.columns and "Pain" not in df.columns:
+        df["Pain"] = df["Pain_Scale"]
+    if "Fatigue_Scale" in df.columns and "Fatigue" not in df.columns:
+        df["Fatigue"] = df["Fatigue_Scale"]
+
+    return df
+
+def load_profiles():
+    df = load_sheet(PROFILES_SHEET)
+    if df.empty:
+        return pd.DataFrame(columns=["Username", "Name", "Age", "Condition", "Specialization", "Role"])
     df.columns = [c.strip() for c in df.columns]
     return df
 
@@ -270,10 +281,10 @@ def get_patients_for_doctor(doctor):
 # -------------------------------
 # User management
 # -------------------------------
-def save_user(username, password, role="patient"):
+def save_user(username, password, role="patient", name="", age="", gender="", condition=""):
     try:
         ws = get_worksheet(USER_SHEET)
-        ws.append_row([username, password, role])
+        ws.append_row([username, password, role, name, age, gender, condition])
         clear_read_cache()
         return True
     except Exception as e:
@@ -296,13 +307,10 @@ def login_action():
     username = st.session_state.get("login_user", "")
     password = st.session_state.get("login_pass", "")
     df_users = load_users()
-    df_doctors = load_doctors()
 
     matched = pd.DataFrame()
     if "Username" in df_users.columns:
-        matched = df_users[df_users["Username"].str.strip().str.lower() == str(username).strip().lower()]
-    if matched.empty:
-        matched = df_doctors[df_doctors["Username"].astype(str).str.strip().str.lower() == str(username).strip().lower()]
+        matched = df_users[df_users["Username"].astype(str).str.strip().str.lower() == str(username).strip().lower()]
 
     if matched.empty:
         st.error("❌ Username not found")
@@ -326,6 +334,10 @@ def register_action():
     username = st.session_state.get("reg_user","").strip()
     password = st.session_state.get("reg_pass","")
     confirm = st.session_state.get("reg_confirm","")
+    name = st.session_state.get("reg_name","")
+    age = st.session_state.get("reg_age","")
+    gender = st.session_state.get("reg_gender","")
+    condition = st.session_state.get("reg_condition","")
     if not username or not password:
         st.warning("Please enter username and password")
         return
@@ -336,9 +348,17 @@ def register_action():
     if username.lower() in df["Username"].astype(str).str.lower().tolist():
         st.error("This username already exists")
         return
-    save_user(username, password, role="patient")
-    st.success("Registration successful. Please log in.")
-    st.session_state.page = "login"
+    # create user in Users and profile in Profiles
+    if save_user(username, password, role="patient", name=name, age=age, gender=gender, condition=condition):
+        # add to profiles sheet
+        try:
+            ws_profiles = get_worksheet(PROFILES_SHEET)
+            ws_profiles.append_row([username, name, age, condition, "", "patient"])
+            clear_read_cache()
+        except Exception as e:
+            st.error(f"Failed to create profile row: {e}")
+        st.success("Registration successful. Please log in.")
+        st.session_state.page = "login"
 
 # -------------------------------
 # Pages
@@ -370,9 +390,10 @@ def patient_page():
             timestamp,
             st.session_state.username,
             in_flex, mt_flex, ri_flex, pt_flex, th_flex,
-            in_force, mt_force, ri_force, pt_force, th_force,
-            pain, fatigue, notes
+            th_force, in_force, mt_force, ri_force, pt_force,
+            pain, fatigue
         ]
+        # match Data sheet order: Timestamp | Username | IN | MT | RI | PT | TH | TH_Force | IN_Force | MT_Force | RI_Force | PT_Force | Pain_Scale | Fatigue_Scale
         ok = append_row(DATA_SHEET, row)
         if ok:
             st.success("✅ Data saved successfully!")
@@ -383,8 +404,8 @@ def patient_page():
     st.subheader("👨‍⚕️ Assigned Doctor")
     doctor_username = get_doctor_for_patient(st.session_state.username)
     if doctor_username:
-        df_doctors = load_doctors()
-        doc_row = df_doctors[df_doctors["Username"].astype(str).str.lower() == str(doctor_username).strip().lower()]
+        doctors = load_doctors()
+        doc_row = doctors[doctors["Username"].astype(str).str.lower() == str(doctor_username).strip().lower()]
         if not doc_row.empty:
             doc = doc_row.iloc[0]
             st.markdown(f"**Name:** {doc.get('FullName','N/A')}")
@@ -438,8 +459,7 @@ def doctor_page_view():
         return
 
     df_patients = df[df["Username"].astype(str).isin(my_patients)].copy()
-    # coerce numeric where possible
-    numeric_cols = ["IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue"]
+    numeric_cols = ["IN","MT","RI","PT","TH","TH_Force","IN_Force","MT_Force","RI_Force","PT_Force","Pain","Fatigue"]
     for c in numeric_cols:
         if c in df_patients.columns:
             df_patients[c] = pd.to_numeric(df_patients[c], errors="coerce")
@@ -462,9 +482,8 @@ def doctor_page_view():
 
     st.dataframe(df_patients, use_container_width=True)
 
-    # charts
     flex_cols = [c for c in ["IN","MT","RI","PT","TH"] if c in df_patients.columns]
-    force_cols = [c for c in ["IN_Force","MT_Force","RI_Force","PT_Force","TH_Force"] if c in df_patients.columns]
+    force_cols = [c for c in ["TH_Force","IN_Force","MT_Force","RI_Force","PT_Force"] if c in df_patients.columns]
     if flex_cols and "Timestamp" in df_patients.columns:
         fig_flex = px.line(df_patients.sort_values("Timestamp"), x="Timestamp", y=flex_cols, title="Flex Trends")
         st.plotly_chart(fig_flex, use_container_width=True)
@@ -485,24 +504,15 @@ def extra_page():
     if df.empty:
         st.info("No data yet. Please add patient data first.")
     else:
-        # -------------------------------
-        # 🧩 Raw Data Section
-        # -------------------------------
         st.markdown("### 🧾 Raw Patient Data (for filtering and review)")
         name = st.text_input("🔍 Search Patient Name")
         df_filtered = df[df["Username"].str.contains(name, case=False, na=False)] if name else df
 
         st.dataframe(df_filtered, use_container_width=True, height=300)
-
         st.markdown("---")
 
-        # -------------------------------
-        # 🔄 Preprocessing to Astronaut KPI Schema
-        # -------------------------------
         st.markdown("### 🧠 Preprocessed Astronaut KPI Schema")
-
         df_a = df_filtered.copy()
-        # protect against missing Timestamp column
         if "Timestamp" in df_a.columns:
             df_a['Timestamp'] = pd.to_datetime(df_a['Timestamp'], errors='coerce')
         else:
@@ -513,7 +523,6 @@ def extra_page():
         df_a['Phase'] = "P1"
         df_a['Adherence (%)'] = 100
 
-        # Convert Force columns to numeric (and add missing)
         force_cols = ["TH_Force", "IN_Force", "MT_Force", "RI_Force", "PT_Force"]
         for col in force_cols:
             if col in df_a.columns:
@@ -521,17 +530,13 @@ def extra_page():
             else:
                 df_a[col] = pd.NA
 
-        # Create calculated column for average Grip Force
         df_a["Hand: Avg Grip Force"] = df_a[force_cols].mean(axis=1).round(2)
-
-        # Set N/A values for metrics not yet available
         df_a["Hand: VR Error Rate (%)"] = "N/A"
         df_a["Chest: Avg COM-BOS Angle (°)"] = "N/A"
         df_a["Balance: Alarm Triggers/Min"] = "N/A"
         df_a["Locomotion: Max Angle Spike (°)"] = "N/A"
         df_a["P4: Time to Stability (sec)"] = "N/A"
 
-        # Map fatigue/pain (handle different column names gracefully)
         if "Fatigue" in df_a.columns:
             df_a["Fatigue Avg (1–10)"] = df_a["Fatigue"]
         elif "Fatigue_Scale" in df_a.columns:
@@ -546,7 +551,6 @@ def extra_page():
         else:
             df_a["Pain Avg (0–10)"] = pd.NA
 
-        # Final schema columns
         final_cols = [
             "Week", "Phase", "Adherence (%)",
             "Hand: Avg Grip Force", "Hand: VR Error Rate (%)",
@@ -555,19 +559,14 @@ def extra_page():
             "Fatigue Avg (1–10)", "Pain Avg (0–10)"
         ]
 
-        # Ensure final_cols exist in df_a for editor (fill missing columns)
         for col in final_cols:
             if col not in df_a.columns:
                 df_a[col] = pd.NA
 
-        # Display editable table
         st.markdown("#### ✏️ Editable Preprocessed Table")
         edited = st.data_editor(df_a[final_cols], use_container_width=True, num_rows="dynamic")
-
-        # Store edited DataFrame
         df_a = edited.copy()
 
-        # Convert columns that should be numeric
         numeric_cols = [
             "Adherence (%)", "Hand: Avg Grip Force",
             "Chest: Avg COM-BOS Angle (°)", "Balance: Alarm Triggers/Min",
@@ -577,7 +576,6 @@ def extra_page():
         for col in numeric_cols:
             df_a[col] = pd.to_numeric(df_a[col], errors='coerce')
 
-        # Display summary after preprocessing
         st.subheader("📊 Processed Schema Preview")
         st.dataframe(df_a, use_container_width=True, height=300)
         message = st.text_input("📜 Message")
@@ -588,7 +586,6 @@ def extra_page():
                 else:
                     prompt1 = f"""
 You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training.
-... (prompt text intentionally abbreviated here in code for readability)
 INPUT CSV:
 {df_a.to_csv(index=False)}
 """
@@ -606,7 +603,6 @@ INPUT CSV:
                 else:
                     prompt = f"""
 You are a Clinical Rehabilitation Analytics System designed for Astronaut Hand-Body Integration training.
-... (prompt text intentionally abbreviated here in code for readability)
 INPUT CSV DATA (below this line):
 {df_a.to_csv(index=False)}
 """
@@ -616,6 +612,133 @@ INPUT CSV DATA (below this line):
                         st.markdown(response.text, unsafe_allow_html=True)
                     except Exception as e:
                         st.error(f"AI request failed: {e}")
+
+# -------------------------------
+# Doctor profile and Patient profile (hybrid mode: doctors -> Doctors sheet, patients -> Profiles sheet)
+# -------------------------------
+def doctor_profile():
+    st.title("👨‍⚕️ Doctor Profile")
+    username = st.session_state.username
+    doctors = load_doctors()
+    if doctors.empty:
+        st.error("Doctors sheet is empty or could not be loaded.")
+        return
+
+    doc_row = doctors[doctors["Username"].astype(str).str.lower() == str(username).strip().lower()]
+    if doc_row.empty:
+        st.error("Doctor profile not found.")
+        return
+    doc = doc_row.iloc[0]
+
+    st.subheader("📋 Basic Information")
+    st.markdown(f"**Full Name:** {doc.get('FullName','N/A')}")
+    st.markdown(f"**Username:** {doc.get('Username','N/A')}")
+    st.markdown(f"**Specialty:** {doc.get('Specialty','N/A')}")
+    st.markdown(f"**Hospital:** {doc.get('Hospital','N/A')}")
+    st.markdown(f"**Bio:** {doc.get('Bio','N/A')}")
+    # show role from Users sheet as source of truth for login role
+    users = load_users()
+    user_row = users[users["Username"].astype(str).str.lower() == str(username).strip().lower()]
+    if not user_row.empty:
+        st.markdown(f"**Role:** {user_row.iloc[0].get('Role','N/A')}")
+
+    st.markdown("---")
+    st.subheader("👥 Assigned Patients")
+    assigned_usernames = get_patients_for_doctor(username)
+    if not assigned_usernames:
+        st.info("No assigned patients.")
+        return
+
+    profiles_df = load_profiles()
+    if profiles_df.empty:
+        st.info("Profiles sheet empty; assigned patient usernames exist but profiles cannot be loaded.")
+        return
+
+    assigned_profiles = profiles_df[profiles_df["Username"].astype(str).str.lower().isin([p.strip().lower() for p in assigned_usernames])]
+    if assigned_profiles.empty:
+        st.info("Assigned patients not found in Profiles sheet.")
+        return
+
+    display_cols = [c for c in ["Username", "Name", "Age", "Condition"] if c in assigned_profiles.columns]
+    st.dataframe(assigned_profiles[display_cols].reset_index(drop=True), use_container_width=True)
+
+def patient_profile():
+    st.title("👤 Patient Profile")
+    username = st.session_state.username
+    profiles = load_profiles()
+    if profiles.empty:
+        st.error("Profiles sheet is empty or could not be loaded.")
+        return
+
+    pat_row = profiles[profiles["Username"].astype(str).str.lower() == str(username).strip().lower()]
+    if pat_row.empty:
+        st.error("Patient profile not found.")
+        return
+    pat = pat_row.iloc[0]
+
+    st.subheader("📋 Basic Information")
+    st.markdown(f"**Name:** {pat.get('Name','N/A')}")
+    st.markdown(f"**Username:** {pat.get('Username','N/A')}")
+    st.markdown(f"**Age:** {pat.get('Age','N/A')}")
+    st.markdown(f"**Condition:** {pat.get('Condition','N/A')}")
+    # role from profiles or users
+    if "Role" in pat.index:
+        st.markdown(f"**Role:** {pat.get('Role','N/A')}")
+    else:
+        users = load_users()
+        u = users[users["Username"].astype(str).str.lower() == str(username).strip().lower()]
+        if not u.empty:
+            st.markdown(f"**Role:** {u.iloc[0].get('Role','N/A')}")
+
+    st.markdown("---")
+    st.subheader("👨‍⚕️ Assigned Doctor")
+    doctor_username = get_doctor_for_patient(username)
+    if doctor_username:
+        doctors = load_doctors()
+        doc_row = doctors[doctors["Username"].astype(str).str.lower() == str(doctor_username).strip().lower()]
+        if not doc_row.empty:
+            doc = doc_row.iloc[0]
+            st.markdown(f"**Name:** {doc.get('FullName','N/A')}")
+            st.markdown(f"**Specialty:** {doc.get('Specialty','N/A')}")
+        else:
+            # fallback to profiles (if doctor was stored there)
+            profiles_df = load_profiles()
+            doc_row2 = profiles_df[profiles_df["Username"].astype(str).str.lower() == str(doctor_username).strip().lower()] if not profiles_df.empty else pd.DataFrame()
+            if not doc_row2.empty:
+                d = doc_row2.iloc[0]
+                st.markdown(f"**Name:** {d.get('Name','N/A')}")
+                st.markdown(f"**Specialization:** {d.get('Specialization','N/A')}")
+            else:
+                st.warning("Assigned doctor not found in Doctors or Profiles sheet.")
+    else:
+        st.info("No doctor assigned.")
+
+    st.markdown("---")
+    st.subheader("📝 Recent Data Logs")
+    try:
+        df = load_data()
+    except Exception as e:
+        st.error(f"Failed to load data: {e}")
+        return
+
+    if df.empty:
+        st.info("No data recorded yet.")
+        return
+
+    if "Username" not in df.columns:
+        st.error("Data sheet does not contain 'Username' column.")
+        return
+
+    logs = df[df["Username"].astype(str).str.lower() == str(username).strip().lower()].copy()
+    if logs.empty:
+        st.info("No rehab data submitted yet.")
+        return
+
+    if "Timestamp" in logs.columns:
+        logs["Timestamp"] = pd.to_datetime(logs["Timestamp"], errors="coerce")
+        logs = logs.sort_values("Timestamp", ascending=False)
+
+    st.dataframe(logs.head(20), use_container_width=True)
 
 # -------------------------------
 # Manager Dashboard (full)
@@ -636,8 +759,7 @@ def manager_dashboard():
     st.markdown("---")
     st.subheader("Global Patient Analytics (All Patients)")
     if not df_all.empty:
-        # coerce numeric
-        numeric_cols = ["IN","MT","RI","PT","TH","IN_Force","MT_Force","RI_Force","PT_Force","TH_Force","Pain","Fatigue"]
+        numeric_cols = ["IN","MT","RI","PT","TH","TH_Force","IN_Force","MT_Force","RI_Force","PT_Force","Pain","Fatigue"]
         for c in numeric_cols:
             if c in df_all.columns:
                 df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
@@ -649,7 +771,7 @@ def manager_dashboard():
             fig = px.line(df_all.sort_values("Timestamp"), x="Timestamp", y=existing_flex, title="Average Flex Trends (Global)")
             st.plotly_chart(fig, use_container_width=True)
 
-        existing_force = [c for c in ["IN_Force","MT_Force","RI_Force","PT_Force","TH_Force"] if c in df_all.columns]
+        existing_force = [c for c in ["TH_Force","IN_Force","MT_Force","RI_Force","PT_Force"] if c in df_all.columns]
         if existing_force:
             fig2 = px.bar(df_all.groupby("Username")[existing_force].mean().reset_index(), x="Username", y=existing_force, title="Avg Force per Patient (Global)", barmode="group")
             st.plotly_chart(fig2, use_container_width=True)
@@ -662,7 +784,7 @@ def manager_dashboard():
 
     st.markdown("---")
     st.subheader("Per-Doctor Analytics")
-    doctor_filter = st.selectbox("Select Doctor (or leave blank)", [""] + df_doctors["Username"].tolist())
+    doctor_filter = st.selectbox("Select Doctor (or leave blank)", [""] + df_doctors["Username"].tolist() if not df_doctors.empty else [""])
     if doctor_filter:
         patients = get_patients_for_doctor(doctor_filter)
         if not patients:
@@ -671,9 +793,8 @@ def manager_dashboard():
             df_doc = df_all[df_all["Username"].isin(patients)].copy()
             st.markdown(f"**Doctor:** {doctor_filter} — **Patients:** {', '.join(patients)}")
             st.dataframe(df_doc, use_container_width=True, height=250)
-            # charts similar to doctor's view
             flex_cols = [c for c in ["IN","MT","RI","PT","TH"] if c in df_doc.columns]
-            force_cols = [c for c in ["IN_Force","MT_Force","RI_Force","PT_Force","TH_Force"] if c in df_doc.columns]
+            force_cols = [c for c in ["TH_Force","IN_Force","MT_Force","RI_Force","PT_Force"] if c in df_doc.columns]
             if "Timestamp" in df_doc.columns and flex_cols:
                 figf = px.line(df_doc.sort_values("Timestamp"), x="Timestamp", y=flex_cols, title=f"Flex Trend - {doctor_filter}")
                 st.plotly_chart(figf, use_container_width=True)
@@ -688,10 +809,10 @@ def manager_dashboard():
     st.subheader("Manage Assignments")
     colA, colB = st.columns(2)
     with colA:
-        all_patients = df_users[df_users["Role"] == "patient"]["Username"].tolist() if not df_users.empty else []
+        all_patients = load_profiles()[load_profiles()["Role"] == "patient"]["Username"].tolist() if not load_profiles().empty else []
         patient_choice = st.selectbox("Select Patient", [""] + all_patients, key="manager_patient_select")
     with colB:
-        all_doctors = df_doctors["Username"].tolist() if not df_doctors.empty else []
+        all_doctors = load_doctors()["Username"].tolist() if not load_doctors().empty else []
         doctor_choice = st.selectbox("Select Doctor", [""] + all_doctors, key="manager_doctor_select")
 
     assign_btn = st.button("✅ Assign / Reassign", key="manager_assign")
@@ -723,8 +844,10 @@ def manager_dashboard():
             try:
                 ws_doc = get_worksheet(DOCTOR_SHEET)
                 ws_doc.append_row([new_doc_user, new_doc_pass, "doctor", new_doc_full, new_doc_spec, new_doc_hosp, new_doc_bio])
+                ws_profiles = get_worksheet(PROFILES_SHEET)
+                ws_profiles.append_row([new_doc_user, new_doc_full, "", "", new_doc_spec, "doctor"])
                 ws_users = get_worksheet(USER_SHEET)
-                ws_users.append_row([new_doc_user, new_doc_pass, "doctor"])
+                ws_users.append_row([new_doc_user, new_doc_pass, "doctor", new_doc_full, "", "", ""])
                 clear_read_cache()
                 log_audit(st.session_state.username, "Create Doctor", f"{new_doc_user}")
                 st.success("Doctor created.")
@@ -733,44 +856,52 @@ def manager_dashboard():
 
     with mg_col2:
         st.markdown("**Edit / Delete existing doctor**")
-        doc_select = st.selectbox("Select doctor to edit/delete", [""] + load_doctors()["Username"].tolist(), key="edit_doc_select")
+        doc_options = load_doctors()["Username"].tolist() if not load_doctors().empty else [""]
+        doc_select = st.selectbox("Select doctor to edit/delete", [""] + doc_options, key="edit_doc_select")
         if doc_select:
-            df_doctors_local = load_doctors()
-            doc_row = df_doctors_local[df_doctors_local["Username"] == doc_select].iloc[0]
+            profiles_df = load_profiles()
+            doctors_df = load_doctors()
+            doc_row = doctors_df[doctors_df["Username"] == doc_select].iloc[0] if not doctors_df.empty else {}
             e_full = st.text_input("Full Name", value=doc_row.get("FullName",""), key="edit_full")
             e_spec = st.text_input("Specialty", value=doc_row.get("Specialty",""), key="edit_spec")
             e_hosp = st.text_input("Hospital", value=doc_row.get("Hospital",""), key="edit_hosp")
             e_bio = st.text_area("Bio", value=doc_row.get("Bio",""), key="edit_bio")
             if st.button("💾 Save Doctor Profile"):
                 try:
-                    df_tmp = df_doctors_local.copy()
-                    df_tmp.loc[df_tmp["Username"] == doc_select, "FullName"] = e_full
-                    df_tmp.loc[df_tmp["Username"] == doc_select, "Specialty"] = e_spec
-                    df_tmp.loc[df_tmp["Username"] == doc_select, "Hospital"] = e_hosp
-                    df_tmp.loc[df_tmp["Username"] == doc_select, "Bio"] = e_bio
-                    clear_and_update_sheet(DOCTOR_SHEET, df_tmp)
+                    # Update Doctors sheet
+                    df_tmp = doctors_df.copy()
+                    if not df_tmp.empty:
+                        df_tmp.loc[df_tmp["Username"] == doc_select, "FullName"] = e_full
+                        df_tmp.loc[df_tmp["Username"] == doc_select, "Specialty"] = e_spec
+                        df_tmp.loc[df_tmp["Username"] == doc_select, "Hospital"] = e_hosp
+                        df_tmp.loc[df_tmp["Username"] == doc_select, "Bio"] = e_bio
+                        clear_and_update_sheet(DOCTOR_SHEET, df_tmp)
+                    # Update Profiles sheet (specialization and name)
+                    if not profiles_df.empty:
+                        profiles_df.loc[profiles_df["Username"] == doc_select, "Name"] = e_full
+                        profiles_df.loc[profiles_df["Username"] == doc_select, "Specialization"] = e_spec
+                        clear_and_update_sheet(PROFILES_SHEET, profiles_df)
                     clear_read_cache()
                     log_audit(st.session_state.username, "Edit Doctor", f"{doc_select}")
                     st.success("Saved.")
                 except Exception as e:
                     st.error(f"Failed to save doctor profile: {e}")
 
-            # --- Safe delete flow with confirmation modal-style UI (no native modal in Streamlit) ---
             st.markdown("### 🗑️ Delete selected doctor")
             if st.button("🗑 Delete Doctor (show confirmation)"):
                 st.warning(f"⚠️ You are about to delete doctor **{doc_row.get('FullName','')}** ({doc_select}). This will:")
                 st.write("- Remove doctor from Doctors sheet")
                 st.write("- Remove doctor from Users sheet")
                 st.write("- Unassign any patients assigned to this doctor")
-                st.write("**Doctor details:**")
-                st.write(f"• Full name: {doc_row.get('FullName','')}")
-                st.write(f"• Specialty: {doc_row.get('Specialty','')}")
-                st.write(f"• Hospital: {doc_row.get('Hospital','')}")
                 if st.button("✅ Confirm Delete Doctor"):
                     try:
-                        df_doc = load_doctors()
-                        df_doc = df_doc[df_doc["Username"].astype(str).str.lower() != doc_select.lower()]
-                        clear_and_update_sheet(DOCTOR_SHEET, df_doc)
+                        df_profiles_tmp = load_profiles()
+                        df_profiles_tmp = df_profiles_tmp[df_profiles_tmp["Username"].astype(str).str.lower() != doc_select.lower()]
+                        clear_and_update_sheet(PROFILES_SHEET, df_profiles_tmp)
+
+                        df_doctors_tmp = load_doctors()
+                        df_doctors_tmp = df_doctors_tmp[df_doctors_tmp["Username"].astype(str).str.lower() != doc_select.lower()]
+                        clear_and_update_sheet(DOCTOR_SHEET, df_doctors_tmp)
 
                         df_users_tmp = load_users()
                         df_users_tmp = df_users_tmp[df_users_tmp["Username"].astype(str).str.lower() != doc_select.lower()]
@@ -826,6 +957,10 @@ if not st.session_state.logged_in:
         st.text_input("👤 Username", key="reg_user")
         st.text_input("🔑 Password", type="password", key="reg_pass")
         st.text_input("🔁 Confirm Password", type="password", key="reg_confirm")
+        st.text_input("📛 Full name", key="reg_name")
+        st.text_input("🎂 Age", key="reg_age")
+        st.text_input("⚧ Gender", key="reg_gender")
+        st.text_input("🩺 Condition", key="reg_condition")
         col1,col2 = st.columns(2)
         with col1:
             st.button("Sign Up", use_container_width=True, on_click=register_action)
@@ -867,13 +1002,15 @@ elif st.session_state.page == "extra":
 elif st.session_state.page == "mydata":
     my_data_page()
 elif st.session_state.page == "doctor_profile":
-    # doctor_profile function is defined earlier in your original code and preserved.
     try:
         doctor_profile()
     except Exception as e:
         st.error(f"Doctor profile failed: {e}")
 elif st.session_state.page == "patient_profile":
-    patient_profile()
+    try:
+        patient_profile()
+    except Exception as e:
+        st.error(f"Patient profile failed: {e}")
 elif st.session_state.page == "manager":
     if str(st.session_state.role).lower() == "manager":
         manager_dashboard()
